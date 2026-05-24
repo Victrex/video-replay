@@ -72,3 +72,10 @@ if sys.platform == "win32":
     CAPTURE_BACKEND = _cv2.CAP_MSMF
 else:
     CAPTURE_BACKEND = _cv2.CAP_ANY
+
+# ------------------------------------------------------------------
+# Detección de personas y pose corporal (YOLOv8n-pose)
+# ------------------------------------------------------------------
+# Confianza mínima para considerar válida una detección (0.0 – 1.0).
+# Bajar este valor detecta más personas pero con más falsos positivos.
+DETECTION_CONFIDENCE = 0.40

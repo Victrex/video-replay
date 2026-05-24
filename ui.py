@@ -22,7 +22,9 @@ from typing import Dict, Optional
 import numpy as np
 
 import config
+from analyzer import CombatAnalyzer
 from camera_manager import CameraCapture
+from detector import FrameDetector
 from display_manager import CameraCanvas
 from replay_controller import ReplayController, ReplayState
 
@@ -70,7 +72,17 @@ class VideoReplayApp:
         self._btn_pause: Optional[tk.Button] = None
         self._btn_live:  Optional[tk.Button] = None
         self._btn_replay: Optional[tk.Button] = None
+        self._btn_detect: Optional[tk.Button] = None
         self._status_label: Optional[tk.Label] = None
+
+        # Detector de personas y pose
+        self._detector = FrameDetector()
+        # Analizador de combate (puntuación + táctica)
+        self._analyzer = CombatAnalyzer()
+        self._detector.analyzer = self._analyzer
+        self._btn_scoring: Optional[tk.Button] = None
+        self._btn_tactical: Optional[tk.Button] = None
+        self._btn_reset_analysis: Optional[tk.Button] = None
 
         # Timeline / scrubber
         self._timeline_frame: Optional[tk.Frame]   = None
@@ -437,6 +449,62 @@ class VideoReplayApp:
 
         ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=10, pady=10)
 
+        # ── Detección de personas y pose ─────────────────────────────
+        tk.Label(
+            parent, text="Visión artificial:",
+            bg=config.COLOR_PANEL, fg=config.COLOR_TEXT,
+            font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, padx=12)
+
+        self._btn_detect = tk.Button(
+            parent, text="🔍 DETECCIÓN: OFF",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 10),
+            activebackground="#1b5e20", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=6,
+            command=self._toggle_detection,
+            cursor="hand2"
+        )
+        self._btn_detect.pack(fill=tk.X, padx=10, pady=(4, 2))
+
+        # Puntuación asistida
+        self._btn_scoring = tk.Button(
+            parent, text="⚔️ PUNTUACIÓN: OFF",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 10),
+            activebackground="#1b5e20", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=5,
+            command=self._toggle_scoring,
+            cursor="hand2"
+        )
+        self._btn_scoring.pack(fill=tk.X, padx=10, pady=2)
+
+        # Análisis táctico
+        self._btn_tactical = tk.Button(
+            parent, text="🗺️ TÁCTICA: OFF",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 10),
+            activebackground="#1b5e20", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=5,
+            command=self._toggle_tactical,
+            cursor="hand2"
+        )
+        self._btn_tactical.pack(fill=tk.X, padx=10, pady=2)
+
+        # Reiniciar análisis
+        self._btn_reset_analysis = tk.Button(
+            parent, text="🔄 Reiniciar análisis",
+            bg="#2a1a00", fg=config.COLOR_TEXT_DIM,
+            font=("Arial", 9),
+            activebackground="#3a2a00", activeforeground="white",
+            relief=tk.FLAT, padx=8, pady=4,
+            command=self._reset_analysis,
+            cursor="hand2"
+        )
+        self._btn_reset_analysis.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=10, pady=10)
+
         # ── Info de cámaras ───────────────────────────────────────────
         tk.Label(
             parent, text="Cámaras conectadas:",
@@ -482,6 +550,7 @@ class VideoReplayApp:
             # Canvas principal
             with self._frames_lock:
                 mf = self._live_frames.get(self._main_cam_idx)
+            mf = self._apply_detection(mf)
             if self._main_canvas:
                 self._main_canvas.update_frame(mf)
 
@@ -494,6 +563,7 @@ class VideoReplayApp:
         else:  # PLAYING o PAUSED
             with self._frames_lock:
                 mf = self._replay_frames.get(self._main_cam_idx)
+            mf = self._apply_detection(mf)
             if self._main_canvas:
                 self._main_canvas.update_frame(mf)
 
@@ -539,6 +609,36 @@ class VideoReplayApp:
                 pct   = cam0.buffer_fill_percent * 100
                 dur   = self._duration_var.get()
                 self._buffer_var.set(f"Buffer: {pct:.0f}% de {dur}s")
+
+        # Actualizar texto del botón de detección según estado del detector
+        if self._btn_detect:
+            if self._detector.loading:
+                self._btn_detect.config(
+                    text="⏳ Cargando modelo…",
+                    bg="#7b5800"
+                )
+            elif self._detector.enabled:
+                self._btn_detect.config(
+                    text="🔍 DETECCIÓN: ON",
+                    bg="#1b5e20"
+                )
+            else:
+                self._btn_detect.config(
+                    text="🔍 DETECCIÓN: OFF",
+                    bg=config.COLOR_ACCENT
+                )
+
+        # Actualizar botones de análisis
+        if self._btn_scoring:
+            if self._analyzer.scoring_enabled:
+                self._btn_scoring.config(text="⚔️ PUNTUACIÓN: ON",  bg="#1b5e20")
+            else:
+                self._btn_scoring.config(text="⚔️ PUNTUACIÓN: OFF", bg=config.COLOR_ACCENT)
+        if self._btn_tactical:
+            if self._analyzer.tactical_enabled:
+                self._btn_tactical.config(text="🗺️ TÁCTICA: ON",  bg="#1b5e20")
+            else:
+                self._btn_tactical.config(text="🗺️ TÁCTICA: OFF", bg=config.COLOR_ACCENT)
 
         interval = max(1, int(1000 / config.THUMBNAIL_RENDER_FPS))
         self.root.after(interval, self._info_tick)
@@ -587,6 +687,44 @@ class VideoReplayApp:
         new_dur = self._duration_var.get()
         for cam in self.cameras.values():
             cam.set_buffer_seconds(new_dur)
+
+    def _toggle_detection(self) -> None:
+        """Activa o desactiva el detector de personas/pose."""
+        self._detector.toggle()
+        # Si se desactiva la detección, desactivar también el análisis
+        if not self._detector.enabled:
+            self._analyzer.scoring_enabled  = False
+            self._analyzer.tactical_enabled = False
+
+    def _toggle_scoring(self) -> None:
+        """Activa o desactiva la puntuación asistida."""
+        self._analyzer.scoring_enabled = not self._analyzer.scoring_enabled
+        # El scoring necesita que el detector esté encendido
+        if self._analyzer.scoring_enabled and not self._detector.enabled:
+            self._detector.enable()
+
+    def _toggle_tactical(self) -> None:
+        """Activa o desactiva el análisis táctico."""
+        self._analyzer.tactical_enabled = not self._analyzer.tactical_enabled
+        if self._analyzer.tactical_enabled and not self._detector.enabled:
+            self._detector.enable()
+
+    def _reset_analysis(self) -> None:
+        """Reinicia marcador y mapa de calor."""
+        self._analyzer.reset()
+
+    def _apply_detection(self,
+                         frame: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """
+        Si la detección está activa, envía el frame al detector y devuelve
+        el último resultado anotado. Si no hay resultado todavía, devuelve
+        el frame original (sin anotaciones).
+        """
+        if frame is None or not self._detector.enabled:
+            return frame
+        self._detector.submit(frame)
+        result = self._detector.get_result()
+        return result if result is not None else frame
 
     def _set_speed(self, speed: float) -> None:
         self._current_speed = speed
@@ -671,6 +809,7 @@ class VideoReplayApp:
     # ==================================================================
 
     def destroy(self) -> None:
+        self._detector.disable()
         self._replay_ctrl.stop_replay()
         for cam in self.cameras.values():
             cam.stop()
