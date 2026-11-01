@@ -4,83 +4,18 @@ main.py
 Punto de entrada del Sistema de Video Replay Multi-Cámara.
 
 Pasos al arrancar:
-  1. Muestra una ventana splash mientras escanea las cámaras disponibles.
-  2. Si no hay ninguna cámara, muestra un error y sale.
-  3. Crea un CameraCapture por cada cámara encontrada y los inicia.
+  1. Abre el selector: detecta cámaras USB y cámaras IP / NVR de la red.
+  2. El usuario elige cuáles usar (si cancela, la app sale).
+  3. Crea un CameraCapture por cada cámara elegida y los inicia.
   4. Abre la ventana principal VideoReplayApp.
 """
 import sys
 import tkinter as tk
-from tkinter import messagebox, ttk
 
 import config
-from camera_manager import CameraCapture, detect_cameras
+from camera_manager import CameraCapture
+from camera_selector import select_cameras
 from ui import VideoReplayApp
-
-
-# ------------------------------------------------------------------
-# Ventana splash mientras se detectan cámaras
-# ------------------------------------------------------------------
-
-def _run_splash_and_detect():
-    """
-    Abre una ventana splash, detecta cámaras disponibles y la cierra.
-    Devuelve la lista de índices detectados.
-    """
-    splash = tk.Tk()
-    splash.title("Video Replay — Iniciando…")
-    splash.configure(bg=config.COLOR_BG)
-    splash.geometry("420x180")
-    splash.resizable(False, False)
-    splash.overrideredirect(True)   # Sin bordes del sistema
-
-    # Centrar en pantalla
-    splash.update_idletasks()
-    sw = splash.winfo_screenwidth()
-    sh = splash.winfo_screenheight()
-    splash.geometry(f"+{(sw - 420)//2}+{(sh - 180)//2}")
-
-    # Contenido
-    tk.Label(
-        splash, text="🎥  Sistema de Video Replay",
-        bg=config.COLOR_BG, fg=config.COLOR_TEXT,
-        font=("Arial", 15, "bold")
-    ).pack(pady=(28, 6))
-
-    tk.Label(
-        splash, text="Para Taekwondo · Multi-Cámara",
-        bg=config.COLOR_BG, fg=config.COLOR_TEXT_DIM,
-        font=("Arial", 10)
-    ).pack()
-
-    msg_var = tk.StringVar(value="Detectando cámaras…")
-    tk.Label(
-        splash, textvariable=msg_var,
-        bg=config.COLOR_BG, fg=config.COLOR_ACCENT,
-        font=("Arial", 10)
-    ).pack(pady=(12, 0))
-
-    # Barra de progreso
-    pb = ttk.Progressbar(splash, length=300, mode="determinate",
-                         maximum=config.MAX_CAMERAS_SCAN)
-    pb.pack(pady=10)
-    splash.update()
-
-    # Detectar cámaras actualizando la barra de progreso
-    detected = []
-
-    def _progress(current, total):
-        msg_var.set(f"Escaneando índice {current} / {total - 1}…")
-        pb["value"] = current
-        splash.update()
-
-    detected = detect_cameras(
-        max_index=config.MAX_CAMERAS_SCAN,
-        progress_callback=_progress
-    )
-
-    splash.destroy()
-    return detected
 
 
 # ------------------------------------------------------------------
@@ -88,31 +23,22 @@ def _run_splash_and_detect():
 # ------------------------------------------------------------------
 
 def main():
-    cam_indices = _run_splash_and_detect()
+    specs = select_cameras()
 
-    if not cam_indices:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            "Sin cámaras",
-            "No se detectó ninguna cámara conectada.\n\n"
-            "• Conecta al menos una webcam USB.\n"
-            "• Asegúrate de que ninguna otra aplicación\n"
-            "  esté usando la cámara.\n"
-            "• Vuelve a intentarlo."
-        )
-        root.destroy()
-        sys.exit(1)
+    if not specs:
+        sys.exit(0)
 
-    # Crear e iniciar un CameraCapture por cada cámara
+    # Crear e iniciar un CameraCapture por cada cámara elegida
     cameras = {}
-    for idx in cam_indices:
+    for spec in specs:
         cam = CameraCapture(
-            camera_index=idx,
-            buffer_seconds=config.DEFAULT_BUFFER_DURATION
+            camera_index=spec.key,
+            buffer_seconds=config.DEFAULT_BUFFER_DURATION,
+            source_url=spec.url,
+            label=spec.label
         )
         cam.start()
-        cameras[idx] = cam
+        cameras[spec.key] = cam
 
     # Ventana principal
     root = tk.Tk()

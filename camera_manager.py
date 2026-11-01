@@ -8,11 +8,17 @@ Uso de memoria estimado:
   640×480 @ JPEG-75 ≈ 8–15 KB por frame
   30 fps × 60 s × 10 cámaras × 12 KB ≈ 216 MB
 """
+import os
 import sys
 import threading
 import time
 from collections import deque
 from typing import List, Optional
+
+# Transporte RTSP por TCP (más estable que UDP) y timeout de 5 s.
+# Debe fijarse antes de importar cv2.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                      "rtsp_transport;tcp|stimeout;5000000")
 
 import cv2
 import numpy as np
@@ -31,8 +37,12 @@ class CameraCapture:
     """
 
     def __init__(self, camera_index: int,
-                 buffer_seconds: int = config.DEFAULT_BUFFER_DURATION):
+                 buffer_seconds: int = config.DEFAULT_BUFFER_DURATION,
+                 source_url: Optional[str] = None,
+                 label: Optional[str] = None):
         self.index = camera_index
+        self.source_url = source_url
+        self.label = label or (f"IP {source_url}" if source_url else f"Cam {camera_index + 1}")
         self._buffer_seconds = buffer_seconds
         self._maxlen = config.CAPTURE_FPS * buffer_seconds
 
@@ -85,6 +95,7 @@ class CameraCapture:
         self._open_cap()
 
         fps_counter = 0
+        last_store = 0.0
         fps_timer = time.time()
 
         while self._running:
@@ -104,14 +115,30 @@ class CameraCapture:
 
             self.is_connected = True
 
+            # Guardar como máximo CAPTURE_FPS frames/s (cámaras IP de 50/60 fps)
+            now = time.monotonic()
+            if now - last_store < 0.9 / max(config.CAPTURE_FPS, 1):
+                continue
+            last_store = now
+
+            # Limitar la resolución (las cámaras IP/NVR suelen entregar
+            # 1080p o más y saturarían CPU y memoria del buffer)
+            max_w = config.BUFFER_MAX_WIDTH
+            if max_w and frame.shape[1] > max_w:
+                scale = max_w / frame.shape[1]
+                frame = cv2.resize(
+                    frame, (max_w, max(1, int(frame.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA)
+
             # Guardar frame más reciente para display live
             with self._latest_lock:
                 self._latest_frame = frame
 
-            # Comprimir a JPEG y agregar al buffer circular
+            # Comprimir a JPEG y agregar al buffer circular con su marca de
+            # tiempo (permite sincronizar cámaras con FPS distintos)
             encoded = self._encode_jpeg(frame)
             with self._buffer_lock:
-                self._buffer.append(encoded)
+                self._buffer.append((time.monotonic(), encoded))
 
             # Calcular FPS real
             fps_counter += 1
@@ -144,6 +171,11 @@ class CameraCapture:
         Llamar esto en todos los CameraCapture dentro del mismo lock externo
         garantiza la sincronía del replay.
         """
+        with self._buffer_lock:
+            return [jpeg for _, jpeg in self._buffer]
+
+    def snapshot_timed(self) -> List[tuple]:
+        """Como snapshot_buffer pero devuelve [(timestamp, jpeg_bytes), ...]."""
         with self._buffer_lock:
             return list(self._buffer)
 
@@ -187,6 +219,30 @@ class CameraCapture:
     # ------------------------------------------------------------------
 
     def _open_cap(self) -> None:
+        if self.source_url:
+            is_rtsp = self.source_url.lower().startswith("rtsp")
+            order = (cv2.CAP_FFMPEG, cv2.CAP_ANY) if is_rtsp else \
+                    (cv2.CAP_FFMPEG, config.CAPTURE_BACKEND, cv2.CAP_ANY)
+            backends = []
+            for backend in order:
+                if backend not in backends:
+                    backends.append(backend)
+            for backend in backends:
+                try:
+                    cap = cv2.VideoCapture(self.source_url, backend)
+                    if cap is not None:
+                        if cap.isOpened():
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            self._cap = cap
+                            self.is_connected = True
+                            return
+                        cap.release()
+                except Exception:
+                    pass
+            self._cap = None
+            self.is_connected = False
+            return
+
         cap = cv2.VideoCapture(self.index, config.CAPTURE_BACKEND)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAPTURE_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAPTURE_HEIGHT)

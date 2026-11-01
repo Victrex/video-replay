@@ -16,8 +16,11 @@ Layout
 """
 import threading
 import tkinter as tk
-from tkinter import ttk
-from typing import Dict, Optional
+import ctypes
+from ctypes import wintypes
+from dataclasses import dataclass
+from tkinter import messagebox, ttk
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -34,6 +37,102 @@ MAIN_H = 540
 # Tamaño de las miniaturas (px)
 THUMB_H = 90
 THUMB_W = int(THUMB_H * 16 / 9)   # 160 px
+
+
+@dataclass
+class MonitorInfo:
+    """Información de un monitor físico disponible para salida secundaria."""
+    monitor_id: str
+    label: str
+    x: int
+    y: int
+    width: int
+    height: int
+    primary: bool
+
+
+def _detect_monitors(root: tk.Tk) -> List[MonitorInfo]:
+    """
+    Obtiene la lista de monitores.
+    En Windows usa la API nativa para soportar multimonitor real.
+    """
+    if hasattr(ctypes, "windll"):
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        class MONITORINFOEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+                ("szDevice", wintypes.WCHAR * 32),
+            ]
+
+        MONITORINFOF_PRIMARY = 0x00000001
+        monitors: List[MonitorInfo] = []
+
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            wintypes.HMONITOR,
+            wintypes.HDC,
+            ctypes.POINTER(RECT),
+            wintypes.LPARAM,
+        )
+
+        @MONITORENUMPROC
+        def _enum_proc(h_monitor, _hdc, _lprc, _lparam):
+            info = MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            if user32.GetMonitorInfoW(h_monitor, ctypes.byref(info)):
+                left = int(info.rcMonitor.left)
+                top = int(info.rcMonitor.top)
+                width = int(info.rcMonitor.right - info.rcMonitor.left)
+                height = int(info.rcMonitor.bottom - info.rcMonitor.top)
+                is_primary = bool(info.dwFlags & MONITORINFOF_PRIMARY)
+                monitors.append(
+                    MonitorInfo(
+                        monitor_id=info.szDevice,
+                        label="",
+                        x=left,
+                        y=top,
+                        width=width,
+                        height=height,
+                        primary=is_primary,
+                    )
+                )
+            return 1
+
+        user32.EnumDisplayMonitors(0, 0, _enum_proc, 0)
+
+        if monitors:
+            monitors.sort(key=lambda m: (not m.primary, m.x, m.y))
+            for i, mon in enumerate(monitors, start=1):
+                p = " (principal)" if mon.primary else ""
+                mon.label = f"Monitor {i}{p} - {mon.width}x{mon.height}"
+            return monitors
+
+    # Fallback: entorno sin API de Windows o detección no disponible
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    return [
+        MonitorInfo(
+            monitor_id="primary",
+            label=f"Monitor 1 (principal) - {sw}x{sh}",
+            x=0,
+            y=0,
+            width=sw,
+            height=sh,
+            primary=True,
+        )
+    ]
 
 
 class VideoReplayApp:
@@ -79,6 +178,22 @@ class VideoReplayApp:
         self._tl_end_label: Optional[tk.Label]     = None
         # Referencia al contenedor del canvas principal (para pack after=)
         self._main_canvas_container: Optional[tk.Frame] = None
+
+        # Zoom en canvas principal
+        self._zoom_info_var = tk.StringVar(value="Zoom: 1.00x")
+        self._zoom_pick_mode = tk.BooleanVar(value=True)
+
+        # Salida de replay en monitor secundario
+        self._monitors = _detect_monitors(root)
+        self._monitor_map: Dict[str, MonitorInfo] = {
+            m.monitor_id: m for m in self._monitors
+        }
+        default_monitor = self._monitors[0].monitor_id if self._monitors else ""
+        self._share_monitor_var = tk.StringVar(value=default_monitor)
+        self._share_window: Optional[tk.Toplevel] = None
+        self._share_canvas: Optional[CameraCanvas] = None
+        self._btn_share_open: Optional[tk.Button] = None
+        self._btn_share_close: Optional[tk.Button] = None
 
         # Controlador de replay
         self._replay_ctrl = ReplayController(
@@ -130,9 +245,14 @@ class VideoReplayApp:
         self._main_canvas = CameraCanvas(
             container, MAIN_W, MAIN_H,
             cam_index=first_cam,
-            is_main=True
+            is_main=True,
+            label=self._cam_label(first_cam)
         )
         self._main_canvas.widget.pack(anchor=tk.CENTER)
+
+        # Click para seleccionar zona de zoom y rueda para zoom in/out.
+        self._main_canvas.bind_video_event("<Button-1>", self._on_main_canvas_click)
+        self._main_canvas.bind_video_event("<MouseWheel>", self._on_main_canvas_wheel)
 
     # ------------------------------------------------------------------
     # Timeline / scrubber de replay
@@ -291,7 +411,8 @@ class VideoReplayApp:
                 inner, THUMB_W, THUMB_H,
                 cam_index=idx,
                 on_click=self._select_main_camera,
-                is_main=False
+                is_main=False,
+                label=self._cam_label(idx)
             )
             tc.widget.pack(side=tk.LEFT, padx=4, pady=2)
             self._thumb_canvases[idx] = tc
@@ -437,6 +558,123 @@ class VideoReplayApp:
 
         ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=10, pady=10)
 
+        # ── Zoom de la vista principal ───────────────────────────────
+        tk.Label(
+            parent, text="Zoom (vista principal):",
+            bg=config.COLOR_PANEL, fg=config.COLOR_TEXT,
+            font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, padx=12)
+
+        tk.Label(
+            parent, textvariable=self._zoom_info_var,
+            bg=config.COLOR_PANEL, fg=config.COLOR_TEXT_DIM,
+            font=("Arial", 9)
+        ).pack(anchor=tk.W, padx=12, pady=(0, 2))
+
+        zoom_row = tk.Frame(parent, bg=config.COLOR_PANEL)
+        zoom_row.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        tk.Button(
+            zoom_row, text="-",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 10, "bold"),
+            relief=tk.FLAT, padx=8, pady=2,
+            command=self._zoom_out,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(
+            zoom_row, text="+",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 10, "bold"),
+            relief=tk.FLAT, padx=8, pady=2,
+            command=self._zoom_in,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(
+            zoom_row, text="Reset",
+            bg=config.COLOR_BTN_LIVE, fg="white",
+            font=("Arial", 9),
+            relief=tk.FLAT, padx=8, pady=2,
+            command=self._zoom_reset,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Checkbutton(
+            parent,
+            text="Click para elegir zona",
+            variable=self._zoom_pick_mode,
+            bg=config.COLOR_PANEL,
+            fg=config.COLOR_TEXT,
+            selectcolor=config.COLOR_ACCENT,
+            activebackground=config.COLOR_PANEL,
+            activeforeground=config.COLOR_TEXT,
+            font=("Arial", 9)
+        ).pack(anchor=tk.W, padx=12, pady=(0, 2))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=10, pady=10)
+
+        # ── Compartir replay en otro monitor ─────────────────────────
+        tk.Label(
+            parent, text="Salida replay en monitor:",
+            bg=config.COLOR_PANEL, fg=config.COLOR_TEXT,
+            font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, padx=12)
+
+        monitor_choices = [m.label for m in self._monitors]
+        id_by_label = {m.label: m.monitor_id for m in self._monitors}
+        selected_label = monitor_choices[0] if monitor_choices else ""
+
+        monitor_combo = ttk.Combobox(
+            parent,
+            values=monitor_choices,
+            state="readonly",
+            font=("Arial", 9)
+        )
+        monitor_combo.set(selected_label)
+        monitor_combo.pack(fill=tk.X, padx=12, pady=(4, 4))
+
+        def _on_monitor_selected(_event=None):
+            label = monitor_combo.get()
+            monitor_id = id_by_label.get(label)
+            if monitor_id:
+                self._share_monitor_var.set(monitor_id)
+                if self._share_window is not None:
+                    mon = self._monitor_map.get(monitor_id)
+                    if mon:
+                        self._position_share_window(mon)
+
+        monitor_combo.bind("<<ComboboxSelected>>", _on_monitor_selected)
+        _on_monitor_selected()
+
+        share_row = tk.Frame(parent, bg=config.COLOR_PANEL)
+        share_row.pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        self._btn_share_open = tk.Button(
+            share_row, text="Abrir salida",
+            bg=config.COLOR_ACCENT, fg="white",
+            font=("Arial", 9),
+            relief=tk.FLAT, padx=8, pady=4,
+            command=self._open_share_window,
+            cursor="hand2",
+            state=tk.DISABLED
+        )
+        self._btn_share_open.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        self._btn_share_close = tk.Button(
+            share_row, text="Cerrar",
+            bg="#7a1f2f", fg="white",
+            font=("Arial", 9),
+            relief=tk.FLAT, padx=8, pady=4,
+            command=self._close_share_window,
+            cursor="hand2",
+            state=tk.DISABLED
+        )
+        self._btn_share_close.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=10, pady=10)
+
         # ── Info de cámaras ───────────────────────────────────────────
         tk.Label(
             parent, text="Cámaras conectadas:",
@@ -451,7 +689,7 @@ class VideoReplayApp:
         for idx in sorted(self.cameras.keys()):
             lbl = tk.Label(
                 cam_info_frame,
-                text=f"Cam {idx + 1}: —",
+                text=f"{self._cam_label(idx)}: —",
                 bg=config.COLOR_PANEL,
                 fg=config.COLOR_TEXT_DIM,
                 font=("Arial", 9),
@@ -491,11 +729,17 @@ class VideoReplayApp:
                     tf = self._live_frames.get(idx)
                 tc.update_frame(tf)
 
+            # En LIVE no se comparte salida externa.
+            if self._share_canvas:
+                self._share_canvas.update_frame(None)
+
         else:  # PLAYING o PAUSED
             with self._frames_lock:
                 mf = self._replay_frames.get(self._main_cam_idx)
             if self._main_canvas:
                 self._main_canvas.update_frame(mf)
+            if self._share_canvas:
+                self._share_canvas.update_frame(mf)
 
             for idx, tc in self._thumb_canvases.items():
                 with self._frames_lock:
@@ -529,7 +773,7 @@ class VideoReplayApp:
                 buf_s  = cam.buffer_seconds_filled
                 fps    = cam.fps_actual
                 lbl.config(
-                    text=f"Cam {idx + 1}: {fps:.0f}fps  buf={buf_s:.0f}s  [{status}]",
+                    text=f"{cam.label}: {fps:.0f}fps  buf={buf_s:.0f}s  [{status}]",
                     fg=config.COLOR_LIVE if cam.is_connected else "#ff4444"
                 )
 
@@ -559,10 +803,18 @@ class VideoReplayApp:
     # Selección de cámara principal
     # ==================================================================
 
+    def _cam_label(self, cam_idx: int) -> str:
+        cam = self.cameras.get(cam_idx)
+        return cam.label if cam else f"Cam {cam_idx + 1}"
+
     def _select_main_camera(self, cam_idx: int) -> None:
         self._main_cam_idx = cam_idx
         if self._main_canvas:
             self._main_canvas.cam_index = cam_idx
+            self._main_canvas.set_label_text(self._cam_label(cam_idx))
+        if self._share_canvas:
+            self._share_canvas.cam_index = cam_idx
+            self._share_canvas.set_label_text(self._cam_label(cam_idx))
         self._update_thumb_selection()
 
     def _update_thumb_selection(self) -> None:
@@ -570,12 +822,122 @@ class VideoReplayApp:
             tc.set_selected(idx == self._main_cam_idx)
 
     # ==================================================================
+    # Zoom del canvas principal
+    # ==================================================================
+
+    def _update_zoom_label(self) -> None:
+        if not self._main_canvas:
+            self._zoom_info_var.set("Zoom: 1.00x")
+            return
+        self._zoom_info_var.set(f"Zoom: {self._main_canvas.get_zoom_factor():.2f}x")
+
+    def _zoom_in(self) -> None:
+        if self._main_canvas:
+            self._main_canvas.zoom_in(0.25)
+            self._update_zoom_label()
+
+    def _zoom_out(self) -> None:
+        if self._main_canvas:
+            self._main_canvas.zoom_out(0.25)
+            self._update_zoom_label()
+
+    def _zoom_reset(self) -> None:
+        if self._main_canvas:
+            self._main_canvas.reset_zoom()
+            self._update_zoom_label()
+
+    def _on_main_canvas_click(self, event) -> None:
+        if not self._main_canvas or not self._zoom_pick_mode.get():
+            return
+        if self._main_canvas.set_zoom_center_from_canvas(event.x, event.y):
+            if self._main_canvas.get_zoom_factor() <= 1.0:
+                self._main_canvas.set_zoom_factor(1.5)
+            self._update_zoom_label()
+
+    def _on_main_canvas_wheel(self, event) -> None:
+        if not self._main_canvas:
+            return
+        if event.delta > 0:
+            self._main_canvas.zoom_in(0.15)
+        elif event.delta < 0:
+            self._main_canvas.zoom_out(0.15)
+        self._update_zoom_label()
+
+    # ==================================================================
+    # Salida de replay a otro monitor
+    # ==================================================================
+
+    def _open_share_window(self) -> None:
+        if self._replay_ctrl.state == ReplayState.LIVE:
+            return
+
+        mon_id = self._share_monitor_var.get()
+        mon = self._monitor_map.get(mon_id)
+        if mon is None:
+            return
+
+        if self._share_window is not None:
+            self._position_share_window(mon)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Salida Replay")
+        win.configure(bg="black")
+        win.protocol("WM_DELETE_WINDOW", self._close_share_window)
+
+        self._share_window = win
+        self._position_share_window(mon)
+
+        self._share_canvas = CameraCanvas(
+            win,
+            max(320, mon.width),
+            max(180, mon.height),
+            cam_index=self._main_cam_idx,
+            is_main=True,
+            label=self._cam_label(self._main_cam_idx)
+        )
+        self._share_canvas.widget.pack(fill=tk.BOTH, expand=True)
+
+        if self._btn_share_open:
+            self._btn_share_open.config(state=tk.DISABLED)
+        if self._btn_share_close:
+            self._btn_share_close.config(state=tk.NORMAL)
+
+    def _position_share_window(self, mon: MonitorInfo) -> None:
+        if not self._share_window:
+            return
+        self._share_window.geometry(f"{mon.width}x{mon.height}+{mon.x}+{mon.y}")
+        self._share_window.lift()
+
+    def _close_share_window(self) -> None:
+        if self._share_window is not None:
+            try:
+                self._share_window.destroy()
+            except Exception:
+                pass
+        self._share_window = None
+        self._share_canvas = None
+
+        if self._btn_share_open:
+            self._btn_share_open.config(
+                state=(tk.NORMAL if self._replay_ctrl.state != ReplayState.LIVE else tk.DISABLED)
+            )
+        if self._btn_share_close:
+            self._btn_share_close.config(state=tk.DISABLED)
+
+    # ==================================================================
     # Acciones de los botones
     # ==================================================================
 
     def _trigger_replay(self) -> None:
         duration = self._duration_var.get()
-        self._replay_ctrl.trigger_replay(self.cameras, duration)
+        if not self._replay_ctrl.trigger_replay(self.cameras, duration):
+            messagebox.showinfo(
+                "Replay",
+                "Todavía no hay video grabado en el buffer.\n\n"
+                "Espera unos segundos a que las cámaras muestren señal "
+                "e inténtalo de nuevo.",
+                parent=self.root)
 
     def _toggle_pause(self) -> None:
         self._replay_ctrl.toggle_pause()
@@ -621,6 +983,12 @@ class VideoReplayApp:
             # Ocultar timeline
             if self._timeline_frame:
                 self._timeline_frame.pack_forget()
+            # La salida compartida solo aplica durante replay.
+            self._close_share_window()
+            if self._btn_share_open:
+                self._btn_share_open.config(state=tk.DISABLED)
+            if self._btn_share_close:
+                self._btn_share_close.config(state=tk.DISABLED)
             # Limpiar frames de replay para no mostrar el último frame congelado
             with self._frames_lock:
                 self._replay_frames = {i: None for i in self.cameras}
@@ -640,6 +1008,12 @@ class VideoReplayApp:
                 self._timeline_frame.pack(
                     fill=tk.X,
                     after=self._main_canvas_container
+                )
+            if self._btn_share_open and self._share_window is None:
+                self._btn_share_open.config(state=tk.NORMAL)
+            if self._btn_share_close:
+                self._btn_share_close.config(
+                    state=(tk.NORMAL if self._share_window is not None else tk.DISABLED)
                 )
 
         elif state == ReplayState.PAUSED:
@@ -666,11 +1040,19 @@ class VideoReplayApp:
                         state=tk.NORMAL, text="▶  REANUDAR"
                     )
 
+            if self._btn_share_open and self._share_window is None:
+                self._btn_share_open.config(state=tk.NORMAL)
+            if self._btn_share_close:
+                self._btn_share_close.config(
+                    state=(tk.NORMAL if self._share_window is not None else tk.DISABLED)
+                )
+
     # ==================================================================
     # Limpieza al cerrar
     # ==================================================================
 
     def destroy(self) -> None:
+        self._close_share_window()
         self._replay_ctrl.stop_replay()
         for cam in self.cameras.values():
             cam.stop()

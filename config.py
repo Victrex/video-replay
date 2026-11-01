@@ -23,6 +23,9 @@ DEFAULT_BUFFER_DURATION = 30
 # Con 10 cámaras a 30fps, 60s y calidad 75:
 #   ~12 KB/frame × 1800 frames × 10 cámaras ≈ 216 MB RAM
 BUFFER_JPEG_QUALITY = 75
+# Ancho máximo (px) de los frames guardados. Las cámaras IP/NVR en 1080p o 4K
+# se reducen a este ancho para no saturar CPU ni RAM. 0 = sin límite.
+BUFFER_MAX_WIDTH = 1280
 
 # ------------------------------------------------------------------
 # Velocidades de replay
@@ -35,6 +38,30 @@ DEFAULT_REPLAY_SPEED  = 1.0
 # ------------------------------------------------------------------
 # Se escanearán los índices 0 … MAX_CAMERAS_SCAN-1
 MAX_CAMERAS_SCAN = 10
+
+# Red local para detectar cámaras IP / NVR. Si está vacío, se infiere desde
+# la IP actual del equipo; si se especifica, debe ser un CIDR válido, por ej.:
+# "192.168.1.0/24"
+NETWORK_SCAN_SUBNET = ""
+NETWORK_SCAN_TIMEOUT = 0.4
+# Puertos que se sondean en cada host (se añaden RTSP, HTTP y puertos SDK de
+# Hikvision/Dahua automáticamente)
+NETWORK_DISCOVERY_PORTS = [554, 8554, 80, 8080, 8000, 37777]
+# Rutas RTSP sin credenciales que se prueban en cámaras abiertas
+NETWORK_DISCOVERY_PATHS = [
+    "/stream1",
+    "/live",
+    "/cam/realmonitor?channel=1&subtype=0",
+    "/h264/ch1/main/av_stream",
+    "/Streaming/Channels/101",
+    "/11",
+]
+
+# URLs fijas que siempre aparecen en el selector, por ej.:
+# "rtsp://usuario:clave@192.168.1.50:554/stream1"
+# (Las credenciales de NVR y URLs agregadas desde el selector se guardan en
+#  network_cameras.json, que no se sube a git.)
+MANUAL_NETWORK_CAMERA_URLS = []
 
 # ------------------------------------------------------------------
 # Ventana principal

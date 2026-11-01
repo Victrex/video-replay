@@ -9,6 +9,7 @@ Flujo:
   3. El hilo `_replay_loop` entrega cada dict {cam_idx: bgr_frame} al callback
   4. stop_replay() / pause() / resume() controlan el estado
 """
+import bisect
 import threading
 import time
 from enum import Enum
@@ -87,7 +88,7 @@ class ReplayController:
     # Trigger del replay
     # ------------------------------------------------------------------
 
-    def trigger_replay(self, cameras: dict, duration_sec: int) -> None:
+    def trigger_replay(self, cameras: dict, duration_sec: int) -> bool:
         """
         Inicia el replay.
 
@@ -100,15 +101,16 @@ class ReplayController:
         self.stop_replay()
 
         # ── Snapshot sincronizado ──────────────────────────────────────
-        # Lanzar un hilo por cámara para llamar snapshot_buffer()
+        # Lanzar un hilo por cámara para llamar snapshot_timed()
         # simultáneamente y minimizar el desfase temporal entre cámaras.
-        snapshots: Dict[int, List[bytes]] = {}
+        snapshots: Dict[int, list] = {}
         snap_lock = threading.Lock()
 
         def _snap(idx, cam):
-            buf = cam.snapshot_buffer()
-            with snap_lock:
-                snapshots[idx] = buf
+            buf = cam.snapshot_timed()
+            if buf:
+                with snap_lock:
+                    snapshots[idx] = buf
 
         threads = [
             threading.Thread(target=_snap, args=(idx, cam), daemon=True)
@@ -119,27 +121,40 @@ class ReplayController:
         for t in threads:
             t.join()
 
+        # Descartar cámaras detenidas (su último frame es muy anterior al
+        # de las demás) para que no bloqueen el replay del resto.
+        if snapshots:
+            newest = max(v[-1][0] for v in snapshots.values())
+            snapshots = {i: v for i, v in snapshots.items()
+                         if newest - v[-1][0] <= 3.0}
+
         if not snapshots:
-            return
+            print("[REPLAY] Ninguna cámara tiene video en el buffer todavía.",
+                  flush=True)
+            return False
 
-        # ── Recortar al duration_sec solicitado ────────────────────────
-        max_frames = config.CAPTURE_FPS * duration_sec
-        for idx in list(snapshots.keys()):
-            snapshots[idx] = snapshots[idx][-max_frames:]
+        # ── Línea de tiempo común ──────────────────────────────────────
+        # Las cámaras IP no entregan exactamente CAPTURE_FPS, así que se
+        # remuestrea cada cámara a CAPTURE_FPS usando las marcas de tiempo.
+        t_end = min(v[-1][0] for v in snapshots.values())
+        t_start = max(t_end - duration_sec,
+                      max(v[0][0] for v in snapshots.values()))
+        if t_end - t_start < 0.1:
+            print("[REPLAY] El buffer común es demasiado corto.", flush=True)
+            return False
 
-        # Usar la longitud más corta para mantener sincronía perfecta
-        min_len = min(len(v) for v in snapshots.values())
-        if min_len == 0:
-            return
-
-        # ── Construir lista temporal de frames ─────────────────────────
-        # Cada elemento es un dict con los bytes JPEG de todas las cámaras
-        # en ese instante temporal (índice = posición en el tiempo).
-        self._replay_frames = [
-            {idx: snapshots[idx][i] for idx in snapshots}
-            for i in range(min_len)
-        ]
-
+        step = 1.0 / max(config.CAPTURE_FPS, 1)
+        n_frames = int((t_end - t_start) / step) + 1
+        ts_lists = {i: [f[0] for f in v] for i, v in snapshots.items()}
+        replay_frames = []
+        for n in range(n_frames):
+            t = t_start + n * step
+            frame_dict = {}
+            for i, v in snapshots.items():
+                pos = bisect.bisect_right(ts_lists[i], t) - 1
+                frame_dict[i] = v[max(pos, 0)][1]
+            replay_frames.append(frame_dict)
+        self._replay_frames = replay_frames
         self._current_idx = 0
         self._stop_event.clear()
         self._pause_event.set()   # Empezar reproduciendo (no pausado)
@@ -152,6 +167,7 @@ class ReplayController:
             name="replay-loop"
         )
         self._replay_thread.start()
+        return True
 
     # ------------------------------------------------------------------
     # Control de reproducción

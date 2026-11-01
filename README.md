@@ -57,7 +57,19 @@ Esto instala:
 
 ### 4. Conectar las cámaras
 
-Conectá las webcams **antes** de iniciar el programa. El sistema detecta automáticamente todas las cámaras disponibles al arrancar.
+Conectá las webcams USB **antes** de iniciar el programa. Las cámaras IP y el NVR deben estar en la **misma red** que esta PC.
+
+Al arrancar se abre la ventana **Selección de cámaras**, que detecta:
+
+- Cámaras USB / locales.
+- Cámaras IP y NVR de la red local (escaneo de la subred /24 en busca de RTSP/HTTP).
+
+Marcá las que quieras usar (podés elegir cualquier cantidad) y presioná **▶ Iniciar**.
+
+**Cámaras IP / NVR con usuario y contraseña** (lo habitual): el dispositivo aparece con 🔒. Presioná **Configurar acceso…**, ingresá usuario/contraseña, la marca (Hikvision, Dahua, Genérico o Auto) y cuántos canales buscar; el sistema lista los canales del NVR para que elijas. Las credenciales se guardan en 
+etwork_cameras.json (excluido de git).
+
+Si el dispositivo no se detecta, usá **➕ URL manual…**, por ej. tsp://usuario:clave@192.168.1.50:554/stream1.
 
 ---
 
@@ -66,6 +78,35 @@ Conectá las webcams **antes** de iniciar el programa. El sistema detecta autom�
 ```bash
 python main.py
 ```
+
+---
+
+## Ejecutable para Windows
+
+El ejecutable se genera en `dist\VideoReplay.exe`. Se puede copiar a otra PC
+Windows de la misma arquitectura y ejecutarlo sin instalar Python. La primera
+apertura puede tardar unos segundos.
+
+El ejecutable generado con estos pasos no está firmado digitalmente; Windows
+puede mostrar una advertencia de seguridad al abrirlo.
+
+Para compilarlo nuevamente en Windows con Python 3.13 de 64 bits, desde la
+carpeta del proyecto:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build-exe.bat
+```
+
+El programa guarda `network_cameras.json` junto al ejecutable, no dentro de
+él. Si querés conservar la configuración usada al ejecutar `main.py`, copiá
+ese archivo desde la carpeta del proyecto a la carpeta que contiene el `.exe`.
+La carpeta debe permitir escritura.
+
+> **Privacidad:** `network_cameras.json` puede contener contraseñas en texto
+> sin cifrar. No se incluye automáticamente en el ejecutable; protegé el
+> archivo y copialo solo a equipos de confianza.
 
 ---
 
@@ -139,6 +180,11 @@ Los frames se comprimen en JPEG antes de guardarse en el buffer. La compresión 
 
 ## Solución de problemas
 
+**No aparece el NVR / cámara IP**
+- Confirmá que la PC esté en la misma subred (si no, definí NETWORK_SCAN_SUBNET = "192.168.0.0/24" en config.py).
+- Verificá que RTSP esté habilitado en el NVR/cámara y usá **Configurar acceso…** o una URL manual.
+- Para muchos canales en 1080p/4K usá el stream secundario (checkbox en *Configurar acceso*) para reducir el uso de CPU.
+
 **"No se detectó ninguna cámara"**
 - Verificá que la webcam esté conectada y no la esté usando otro programa (Zoom, Teams, OBS, etc.)
 - En Windows, revisá los permisos de cámara en *Configuración → Privacidad → Cámara*
@@ -163,6 +209,8 @@ SISTEMA DE VIDEOREPLAY/
 ├── main.py               # Punto de entrada
 ├── config.py             # Parámetros ajustables
 ├── camera_manager.py     # Captura y buffer por cámara
+├── camera_selector.py    # Ventana de selección de cámaras (USB + red)
+├── network_discovery.py  # Descubrimiento de cámaras IP / NVR
 ├── replay_controller.py  # Lógica de replay sincronizado
 ├── display_manager.py    # Renderizado de video en Tkinter
 ├── ui.py                 # Interfaz gráfica completa
